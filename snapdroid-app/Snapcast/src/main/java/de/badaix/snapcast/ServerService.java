@@ -24,7 +24,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
@@ -32,8 +31,7 @@ import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.util.Collections;
-import java.util.Enumeration;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
@@ -60,6 +58,8 @@ public class ServerService extends Service {
 
     private static final String TAG = "ServerService";
     public static final String EXTRA_TRACK_URI = "track_uri";
+    /** 接管时从别的服务端带过来的播放位置（秒），起点就跳过去，做到"进度无缝" */
+    public static final String EXTRA_SEEK_SEC = "seek_sec";
     public static final String NOTIFICATION_CHANNEL_ID = "snapserver";
 
     private static final int T_CODEC_HEADER = 1, T_WIRE_CHUNK = 2, T_SERVER_SETTINGS = 3,
@@ -72,6 +72,12 @@ public class ServerService extends Service {
 
     /** 中控判断"本机就是服务器"用 */
     public static volatile boolean RUNNING = false;
+
+    // ---- 角色 / 状态推送（与 snapnode 同构）----
+    private volatile int rev = 0;                 // 状态版本号：多端中控靠它对齐
+    private volatile double pendingSeekSec = -1;  // 接管时带入的起始进度
+    private final List<SseSub> sseClients = new CopyOnWriteArrayList<>();
+    private volatile String hostName = "android";
 
     // ---- 音源状态 ----
     private volatile Uri trackUri = null;
@@ -115,6 +121,7 @@ public class ServerService extends Service {
     public void onCreate() {
         super.onCreate();
         procStartNs = System.nanoTime();
+        hostName = Build.MODEL == null ? "android" : Build.MODEL;
         rebuildEq();
     }
 
@@ -129,6 +136,8 @@ public class ServerService extends Service {
                 Log.e(TAG, "bad track uri", e);
             }
         }
+        if (intent != null)
+            pendingSeekSec = intent.getDoubleExtra(EXTRA_SEEK_SEC, -1);
         if (trackUri == null) {
             Log.e(TAG, "no track uri, stopping");
             stopSelf();
@@ -201,6 +210,13 @@ public class ServerService extends Service {
             }
         }
         clients.clear();
+        for (SseSub s : sseClients) {
+            try {
+                s.sock.close();
+            } catch (Exception ignored) {
+            }
+        }
+        sseClients.clear();
         if (decoderThread != null) decoderThread.interrupt();
         if (tickThread != null) tickThread.interrupt();
         Log.i(TAG, "server stopped");
@@ -225,6 +241,12 @@ public class ServerService extends Service {
     private void startDecoder() {
         final Uri uri = trackUri;
         if (uri == null) return;
+        // 接管时带进来的起始进度：解码线程起来后第一件事就是 seek 过去（"先立后废"）
+        if (pendingSeekSec > 0) {
+            seekRequestUs = (long) (pendingSeekSec * 1000000L);
+            Log.i(TAG, "start at " + pendingSeekSec + "s (handover)");
+            pendingSeekSec = -1;
+        }
         decoderThread = new Thread(() -> decodeLoop(uri), "ss-decoder");
         decoderThread.start();
     }
@@ -368,21 +390,48 @@ public class ServerService extends Service {
     }
 
     private String queryTrackName() {
+        // SAF 选择器给回来的 document id 形如 "audio:295"，直接查 MediaStore.Audio 是查不到行的，
+        // 所以先拿 OpenableColumns.DISPLAY_NAME 兜底，再按 id 回查 ID3 的标题/歌手。
+        String display = null;
         try {
-            android.database.Cursor c = getContentResolver().query(trackUri, null, null, null, null);
+            android.database.Cursor c = getContentResolver().query(trackUri,
+                    new String[]{android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null);
             if (c != null) {
-                if (c.moveToFirst()) {
-                    int ti = c.getColumnIndex(android.provider.MediaStore.Audio.AudioColumns.TITLE);
-                    int ai = c.getColumnIndex(android.provider.MediaStore.Audio.AudioColumns.ARTIST);
-                    if (ti >= 0) trackName = c.getString(ti);
-                    if (ai >= 0) trackArtist = c.getString(ai) == null ? "" : c.getString(ai);
-                }
+                if (c.moveToFirst()) display = c.getString(0);
                 c.close();
             }
         } catch (Exception ignored) {
         }
+        try {
+            String seg = trackUri == null ? null : trackUri.getLastPathSegment();
+            if (seg != null && seg.contains(":")) {
+                String id = seg.substring(seg.lastIndexOf(':') + 1);
+                if (id.matches("\\d+")) {
+                    android.database.Cursor c = getContentResolver().query(
+                            android.content.ContentUris.withAppendedId(
+                                    android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                                    Long.parseLong(id)),
+                            new String[]{android.provider.MediaStore.Audio.AudioColumns.TITLE,
+                                    android.provider.MediaStore.Audio.AudioColumns.ARTIST},
+                            null, null, null);
+                    if (c != null) {
+                        if (c.moveToFirst()) {
+                            String t = c.getString(0);
+                            if (t != null && !t.isEmpty()) {
+                                trackName = t;
+                                String a = c.getString(1);
+                                trackArtist = a == null ? "" : a;
+                            }
+                        }
+                        c.close();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
         if (trackName == null || trackName.isEmpty())
-            trackName = trackUri.getLastPathSegment();
+            trackName = display != null && !display.isEmpty()
+                    ? display : trackUri.getLastPathSegment();
         return trackName;
     }
 
@@ -596,6 +645,7 @@ public class ServerService extends Service {
                 sock.close();
             } catch (Exception ignored) {
             }
+            if (ci.ready) bump();
             Log.i(TAG, "[-] client " + ci.name + " 断开 (剩余 " + clients.size() + ")");
         }
     }
@@ -639,6 +689,10 @@ public class ServerService extends Service {
             } catch (Exception ignored) {
             }
             Log.i(TAG, "    hello from " + ci.name + " v" + ci.version + " " + ci.os);
+            if (!ci.ready) {
+                ci.ready = true;      // 握手后才算在线设备（局域网扫描的探测连接不污染列表）
+                bump();
+            }
             // 关键：refersTo = Hello 请求 id，否则客户端 2s 超时断连
             sendSettings(sock, ci, id);
             byte[] ch = payCodecHeader("pcm", wavHeader());
@@ -796,22 +850,7 @@ public class ServerService extends Service {
     // ================= HTTP 控制端口（1780）=================
 
     private String localIp() {
-        try {
-            java.util.ArrayList<String> all = new java.util.ArrayList<>();
-            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements(); ) {
-                NetworkInterface ni = en.nextElement();
-                if (!ni.isUp() || ni.isLoopback()) continue;
-                for (Enumeration<java.net.InetAddress> ia = ni.getInetAddresses(); ia.hasMoreElements(); ) {
-                    java.net.InetAddress a = ia.nextElement();
-                    if (!a.isLoopbackAddress() && a.getAddress().length == 4)
-                        all.add(a.getHostAddress());
-                }
-            }
-            for (String ip : all) if (ip.startsWith("192.168.")) return ip;
-            return all.isEmpty() ? "127.0.0.1" : all.get(0);
-        } catch (Exception e) {
-            return "127.0.0.1";
-        }
+        return de.badaix.snapcast.utils.LanScanner.localIpv4();
     }
 
     private double positionSec() {
@@ -863,6 +902,12 @@ public class ServerService extends Service {
                 r.read(body);
             }
 
+            // 状态推送：这条连接升级成 SSE 长连接，不按普通请求写完就关
+            if (path.startsWith("/api/events")) {
+                handleSse(sock);
+                return;
+            }
+
             String resp = route(path);
             byte[] body = resp.getBytes(StandardCharsets.UTF_8);
             OutputStream os = sock.getOutputStream();
@@ -874,6 +919,125 @@ public class ServerService extends Service {
             sock.close();
         } catch (SocketTimeoutException ignored) {
         } catch (Exception e) {
+            try {
+                sock.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    // ================= 角色 / 状态推送（与 snapnode 同构）=================
+
+    /** /api/status 的完整快照；SSE 推的也是它 */
+    private JSONObject statusJson() throws Exception {
+        JSONObject o = new JSONObject();
+        JSONObject srv = new JSONObject();
+        srv.put("host", localIp());
+        srv.put("port", STREAM_PORT);
+        srv.put("httpPort", HTTP_PORT);
+        srv.put("name", hostName);
+        srv.put("source", trackName);
+        srv.put("role", "server");            // 手机服务只在放流时存在，没有 follower 态
+        srv.put("upstream", JSONObject.NULL);
+        o.put("server", srv);
+
+        JSONObject media = new JSONObject();
+        media.put("name", trackName);
+        media.put("title", trackName);
+        media.put("artist", trackArtist);
+        media.put("durationSec", (int) (durationUs / 1000000));
+        media.put("positionSec", (int) positionSec());
+        media.put("paused", paused);
+        o.put("media", media);
+
+        JSONObject e = new JSONObject();
+        e.put("low", eq[0]);
+        e.put("mid", eq[1]);
+        e.put("high", eq[2]);
+        e.put("preset", eqPreset);
+        o.put("eq", e);
+
+        JSONArray arr = new JSONArray();
+        for (ClientInfo ci : clients.values()) {
+            if (!ci.ready) continue;   // 只连了 TCP 还没握手的（扫描探针）不算在线
+            JSONObject c = new JSONObject();
+            c.put("id", ci.id);
+            c.put("name", ci.name);
+            c.put("os", ci.os);
+            c.put("version", ci.version);
+            c.put("volume", ci.volume);
+            c.put("muted", ci.muted);
+            c.put("jitter", Math.round(ci.jitter * 100) / 100.0);
+            c.put("drift", Math.round(ci.drift * 100) / 100.0);
+            c.put("samples", ci.diffs.size());
+            c.put("offsetMs", ci.offsetMs);
+            c.put("band", ci.band);
+            arr.put(c);
+        }
+        o.put("clients", arr);
+        o.put("rev", rev);
+        return o;
+    }
+
+    /** 状态一变就推一帧给所有中控（SSE）——多端实时一致，不用靠轮询猜 */
+    private void bump() {
+        rev++;
+        String json;
+        try {
+            json = statusJson().toString();
+        } catch (Exception e) {
+            return;
+        }
+        for (SseSub s : sseClients)
+            pushFrame(s, json);
+    }
+
+    private void pushFrame(SseSub s, String json) {
+        if (!s.write("data: " + json + "\n\n"))
+            sseClients.remove(s);
+    }
+
+    /** 一条 SSE 订阅连接（HttpURLConnection 流式读即可，不需要任何依赖） */
+    private static class SseSub {
+        final Socket sock;
+        final OutputStream out;
+
+        SseSub(Socket sock, OutputStream out) {
+            this.sock = sock;
+            this.out = out;
+        }
+
+        synchronized boolean write(String frame) {
+            try {
+                out.write(frame.getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+    }
+
+    /** 把连接升级成 SSE：先补一帧当前状态，之后由 bump() 推，客户端断开即回收 */
+    private void handleSse(Socket sock) {
+        SseSub sub = null;
+        try {
+            OutputStream os = sock.getOutputStream();
+            os.write(("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" +
+                    "Cache-Control: no-cache\r\nConnection: keep-alive\r\n" +
+                    "Access-Control-Allow-Origin: *\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            os.flush();
+            sub = new SseSub(sock, os);
+            sseClients.add(sub);
+            pushFrame(sub, statusJson().toString());
+            sock.setSoTimeout(0);
+            byte[] buf = new byte[256];       // 忽略客户端上行内容，只为探活
+            while (sock.getInputStream().read(buf) >= 0) {
+                // 客户端关掉连接时 read 返回 -1
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (sub != null) sseClients.remove(sub);
             try {
                 sock.close();
             } catch (Exception ignored) {
@@ -896,49 +1060,56 @@ public class ServerService extends Service {
             }
         }
 
-        if ("/api/status".equals(path)) {
+        if ("/api/status".equals(path))
+            return statusJson().toString();
+
+        // 本机角色：中控靠它显示"当前服务端是谁、是不是本机"
+        if ("/api/who".equals(path)) {
             JSONObject o = new JSONObject();
-            JSONObject srv = new JSONObject();
-            srv.put("host", localIp());
-            srv.put("port", STREAM_PORT);
-            srv.put("source", trackName);
-            o.put("server", srv);
-            JSONObject media = new JSONObject();
-            media.put("name", trackName);
-            media.put("title", trackName);
-            media.put("artist", trackArtist);
-            media.put("durationSec", (int) (durationUs / 1000000));
-            media.put("positionSec", (int) positionSec());
-            media.put("paused", paused);
-            o.put("media", media);
-            JSONObject e = new JSONObject();
-            e.put("low", eq[0]);
-            e.put("mid", eq[1]);
-            e.put("high", eq[2]);
-            e.put("preset", eqPreset);
-            o.put("eq", e);
-            JSONArray arr = new JSONArray();
-            for (ClientInfo ci : clients.values()) {
-                JSONObject c = new JSONObject();
-                c.put("id", ci.id);
-                c.put("name", ci.name);
-                c.put("os", ci.os);
-                c.put("version", ci.version);
-                c.put("volume", ci.volume);
-                c.put("muted", ci.muted);
-                c.put("jitter", Math.round(ci.jitter * 100) / 100.0);
-                c.put("drift", Math.round(ci.drift * 100) / 100.0);
-                c.put("samples", ci.diffs.size());
-                c.put("offsetMs", ci.offsetMs);
-                c.put("band", ci.band);
-                arr.put(c);
-            }
-            o.put("clients", arr);
+            o.put("name", hostName);
+            o.put("host", localIp());
+            o.put("port", STREAM_PORT);
+            o.put("httpPort", HTTP_PORT);
+            o.put("role", "server");
+            o.put("upstream", JSONObject.NULL);
+            o.put("rev", rev);
             return o.toString();
         }
 
+        // 接管：别的设备（PC）来调，拿走曲目与进度，本机随即停流（先应答，再退位）
+        if ("/api/handover".equals(path)) {
+            String to = q.get("to");
+            if (to == null)
+                return new JSONObject().put("error", "missing ?to=<ip>").toString();
+            JSONObject o = new JSONObject();
+            o.put("ok", true);
+            JSONObject ho = new JSONObject();
+            ho.put("to", to);
+            ho.put("httpPort", HTTP_PORT);
+            o.put("handover", ho);
+            o.put("media", statusJson().getJSONObject("media"));  // 新服务端照它 seek 到同一位置
+            o.put("clients", clients.size());
+            new Thread(() -> {
+                try {
+                    Thread.sleep(400);
+                } catch (InterruptedException ignored) {
+                }
+                Log.i(TAG, "handover -> " + to + "，本机停止放流");
+                stopSelf();
+            }, "ss-handover").start();
+            return o.toString();
+        }
+
+        // 收回播放权：本机保持放流（手机端没有 follower 态），保留此接口与 PC 端对称
+        if ("/api/resume".equals(path))
+            return new JSONObject().put("ok", true).put("role", "server").toString();
+
+        if ("/api/follow".equals(path))
+            return new JSONObject().put("error", "not supported on phone server").toString();
+
         if ("/api/pause".equals(path)) {
             paused = "1".equals(q.get("p"));
+            bump();
             return new JSONObject().put("ok", true).put("paused", paused).toString();
         }
 
@@ -948,6 +1119,7 @@ public class ServerService extends Service {
             if (targetUs < 0) targetUs = 0;
             if (durationUs > 0 && targetUs > durationUs) targetUs = durationUs - 1000000;
             seekRequestUs = targetUs;
+            bump();
             return new JSONObject().put("ok", true).toString();
         }
 
@@ -967,6 +1139,7 @@ public class ServerService extends Service {
                     resocketSendSettings(ci);
                 }
             }
+            bump();
             return new JSONObject().put("ok", true).toString();
         }
 
@@ -985,6 +1158,7 @@ public class ServerService extends Service {
                     resocketSendSettings(ci);
                 }
             }
+            bump();
             return new JSONObject().put("ok", true).toString();
         }
 
@@ -1013,6 +1187,7 @@ public class ServerService extends Service {
                 }
             }
             rebuildEq();
+            bump();
             JSONObject e = new JSONObject();
             e.put("ok", true);
             e.put("low", eq[0]);
@@ -1029,6 +1204,7 @@ public class ServerService extends Service {
                 ci.band = band;
                 ci.bandF = null; // 下个 tick 重建滤波器
             }
+            bump();
             return new JSONObject().put("ok", ci != null).toString();
         }
 
@@ -1041,6 +1217,7 @@ public class ServerService extends Service {
             }
             ms = Math.max(-200, Math.min(500, ms));
             if (ci != null) ci.offsetMs = ms;
+            bump();
             return new JSONObject().put("ok", ci != null).toString();
         }
 
@@ -1071,6 +1248,7 @@ public class ServerService extends Service {
         static int seqCounter = 0;
         final int id = ++seqCounter;
         String name = "?", os = "?", version = "?";
+        volatile boolean ready = false;
         int volume = 100;
         boolean muted = false;
         int offsetMs = 0;

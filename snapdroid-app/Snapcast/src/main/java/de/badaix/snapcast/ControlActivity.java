@@ -1,10 +1,12 @@
 package de.badaix.snapcast;
 
 import android.annotation.SuppressLint;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
@@ -13,8 +15,12 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 
+import de.badaix.snapcast.utils.LanScanner;
+import de.badaix.snapcast.utils.ServerHandover;
 import de.badaix.snapcast.utils.Settings;
 
 import org.json.JSONArray;
@@ -36,19 +42,27 @@ import java.util.Locale;
  * 与官方 Snapcast 协议无关——仅对接 snapnode 的控制台 API：
  * GET /api/status, /api/pause?p=, /api/seek?sec=, /api/vol?id=&v=,
  * /api/mute?id=, /api/band?id=&band=, /api/eq?preset=
+ * <p>
+ * 服务端角色（同一局域网只能有一个"源"）：
+ * GET /api/who 显示当前服务端是谁、是不是本机；
+ * GET /api/handover?to= 让别的服务端退位（本机接管播放权时用）；
+ * GET /api/resume 收回播放权（把播放权交还给别的设备时用）。
+ * <p>
+ * 状态同步：订阅 /api/events（SSE），状态一变立刻刷新；3 秒轮询仅作兜底。
  */
 public class ControlActivity extends AppCompatActivity {
 
+    private static final String TAG = "ControlActivity";
     private static final String PREFS = "control_prefs";
     private static final String KEY_HOST = "http_host";
-    private static final long POLL_MS = 1000;
+    private static final long POLL_MS = 3000;
 
     private final Handler main = new Handler(Looper.getMainLooper());
 
     private LinearLayout deviceList;
-    private TextView tvSong, tvArtist, tvPos, tvDur, tvStatus, tvHint;
+    private TextView tvSong, tvArtist, tvPos, tvDur, tvStatus, tvHint, tvRole;
     private SeekBar sbProgress;
-    private Button btnPlay;
+    private Button btnPlay, btnTakeover;
     private EditText etHost;
 
     private String baseUrl = "";
@@ -58,13 +72,40 @@ public class ControlActivity extends AppCompatActivity {
     private int durationSec = 0;
     private String eqPreset = "";
 
+    /** 当前"源"所在 IP（/api/who 解析出来的），接管时要指向它 */
+    private volatile String roleIp = "";
+    private volatile boolean roleLocal = false;
+    private volatile boolean sseRunning = false;
+    private Thread sseThread = null;
+
+    /** 接管要先选一个本机音频文件（手机当服务端必须有本地音源） */
+    private final ActivityResultLauncher<String[]> trackLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
+                if (uri == null || roleIp.isEmpty()) return;
+                try {
+                    getContentResolver().takePersistableUriPermission(uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (Exception ignored) {
+                }
+                Settings.getInstance(this).put("server_track_uri", uri.toString());
+                Settings.getInstance(this).put("handover_remote", roleIp);   // 记着以后交还给谁
+                Toast.makeText(this, "正在从 " + roleIp + " 接管播放权…", Toast.LENGTH_SHORT).show();
+                final String from = roleIp;
+                ServerHandover.takeOver(this, from, ServerHandover.HTTP_PORT, uri, (ok, msg) ->
+                        main.post(() -> {
+                            Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+                            if (ok) applyHost("127.0.0.1:" + ServerHandover.HTTP_PORT, false);
+                            refreshRole();
+                        }));
+            });
+
     private interface JsonCb {
         void onJson(JSONObject o);
 
         void onFail(String err);
     }
 
-    // ---- 轮询 ----
+    // ---- 轮询（SSE 的兜底，3 秒一次；真实时靠 /api/events）----
     private final Runnable pollTask = new Runnable() {
         @Override
         public void run() {
@@ -80,6 +121,7 @@ public class ControlActivity extends AppCompatActivity {
                         setOnline(false, err);
                     }
                 });
+                refreshRole();
             }
             main.postDelayed(this, POLL_MS);
         }
@@ -97,9 +139,11 @@ public class ControlActivity extends AppCompatActivity {
         tvDur = findViewById(R.id.tvDur);
         tvStatus = findViewById(R.id.tvStatus);
         tvHint = findViewById(R.id.tvHint);
+        tvRole = findViewById(R.id.tvRole);
         deviceList = findViewById(R.id.deviceList);
         sbProgress = findViewById(R.id.sbProgress);
         btnPlay = findViewById(R.id.btnPlay);
+        btnTakeover = findViewById(R.id.btnTakeover);
         etHost = findViewById(R.id.etHost);
 
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
@@ -122,6 +166,7 @@ public class ControlActivity extends AppCompatActivity {
                 applyHost(etHost.getText().toString().trim(), true));
 
         btnPlay.setOnClickListener(v -> api("/api/pause?p=" + (paused ? "0" : "1")));
+        btnTakeover.setOnClickListener(v -> onRoleButton());
 
         findViewById(R.id.btnBack10).setOnClickListener(v -> api("/api/seek?sec=-10"));
         findViewById(R.id.btnFwd10).setOnClickListener(v -> api("/api/seek?sec=10"));
@@ -164,12 +209,15 @@ public class ControlActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         main.post(pollTask);
+        startSse();
+        refreshRole();
     }
 
     @Override
     protected void onPause() {
         super.onPause();
         main.removeCallbacks(pollTask);
+        stopSse();
     }
 
     @SuppressLint("SetTextI18n")
@@ -181,6 +229,143 @@ public class ControlActivity extends AppCompatActivity {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_HOST, baseUrl).apply();
         tvHint.setText("Web 控制台: " + baseUrl + "/  （浏览器打开同样可控）");
         if (toast) Toast.makeText(this, "已连接 " + baseUrl, Toast.LENGTH_SHORT).show();
+        stopSse();
+        startSse();
+    }
+
+    // ---- 服务端角色：当前源是谁 / 接管 / 交还 ----
+
+    /** 问一下当前连的这台是 server 还是 follower、源到底在哪 */
+    private void refreshRole() {
+        if (baseUrl.isEmpty()) return;
+        final String url = baseUrl + "/api/who";
+        new Thread(() -> {
+            final String body = ServerHandover.httpGet(url);
+            main.post(() -> renderRole(body));
+        }, "ctl-who").start();
+    }
+
+    @SuppressLint("SetTextI18n")
+    private void renderRole(String whoJson) {
+        final boolean local = ServerService.isRunning();
+        roleLocal = local;
+        String text;
+
+        if (local) {
+            roleIp = LanScanner.localIpv4();
+            String remote = Settings.getInstance(this).getString("handover_remote", "");
+            text = "当前服务端：本机（" + roleIp + "）"
+                    + (remote.isEmpty() ? "" : " · 从 " + remote + " 接管");
+            btnTakeover.setText(remote.isEmpty() ? "停止本机服务器" : "交还播放权");
+            btnTakeover.setVisibility(View.VISIBLE);
+            tvRole.setText(text);
+            return;
+        }
+
+        if (whoJson == null) {
+            roleIp = "";
+            tvRole.setText("当前服务端：未响应（" + baseUrl + "）");
+            btnTakeover.setVisibility(View.GONE);
+            return;
+        }
+        try {
+            JSONObject o = new JSONObject(whoJson);
+            String role = o.optString("role", "server");
+            String host = o.optString("host", "");
+            String up = o.optString("upstream", "");
+            if ("follower".equals(role) && !up.isEmpty()) {
+                roleIp = up.split(":")[0];
+                text = "当前服务端：" + up + "（本页是代理）";
+            } else {
+                roleIp = host;
+                text = "当前服务端：" + host + ":1780";
+            }
+            tvRole.setText(text);
+            boolean canTake = !roleIp.isEmpty() && !roleIp.equals(LanScanner.localIpv4());
+            btnTakeover.setText("接管播放权");
+            btnTakeover.setVisibility(canTake ? View.VISIBLE : View.GONE);
+        } catch (Exception e) {
+            roleIp = "";
+            tvRole.setText("当前服务端：解析失败");
+            btnTakeover.setVisibility(View.GONE);
+        }
+    }
+
+    /** 顶部那个按钮：本机是源就交还，否则接管 */
+    private void onRoleButton() {
+        if (roleLocal) {
+            final String remote = Settings.getInstance(this).getString("handover_remote", "");
+            if (remote.isEmpty()) {
+                stopService(new Intent(this, ServerService.class));
+                Toast.makeText(this, "本机音频服务器已停止", Toast.LENGTH_SHORT).show();
+                refreshRole();
+                return;
+            }
+            Toast.makeText(this, "正在交还播放权给 " + remote + "…", Toast.LENGTH_SHORT).show();
+            ServerHandover.handBack(this, remote, ServerHandover.HTTP_PORT, (ok, msg) -> main.post(() -> {
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+                if (ok) applyHost(remote + ":" + ServerHandover.HTTP_PORT, false);
+                refreshRole();
+            }));
+            return;
+        }
+        if (roleIp.isEmpty()) {
+            Toast.makeText(this, "没找到可接管的服务端", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        // 手机当服务端必须有本机音源：先选文件，选完才真正接管
+        Toast.makeText(this, "接管后由本机放流，请选一个本机音频文件", Toast.LENGTH_LONG).show();
+        trackLauncher.launch(new String[]{"audio/*"});
+    }
+
+    // ---- 状态推送（SSE）：状态一变立刻刷新，比轮询快 ----
+
+    private void startSse() {
+        if (sseRunning || baseUrl.isEmpty()) return;
+        sseRunning = true;
+        final String url = baseUrl + "/api/events";
+        sseThread = new Thread(() -> {
+            HttpURLConnection c = null;
+            try {
+                c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(3000);
+                c.setReadTimeout(0);                 // 长连接：不能设读超时
+                c.setRequestProperty("Accept", "text/event-stream");
+                BufferedReader r = new BufferedReader(
+                        new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
+                String line;
+                while (sseRunning && (line = r.readLine()) != null) {
+                    if (!line.startsWith("data:")) continue;   // ": ping" 心跳忽略
+                    JSONObject o;
+                    try {
+                        o = new JSONObject(line.substring(5).trim());
+                    } catch (Exception bad) {
+                        continue;
+                    }
+                    main.post(() -> {
+                        setOnline(true, null);
+                        renderStatus(o);
+                    });
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "sse ended: " + e.getMessage());
+            } finally {
+                sseRunning = false;
+                if (c != null) try {
+                    c.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }, "ctl-sse");
+        sseThread.start();
+    }
+
+    private void stopSse() {
+        sseRunning = false;
+        if (sseThread != null) {
+            sseThread.interrupt();
+            sseThread = null;
+        }
     }
 
     // ---- 渲染 ----

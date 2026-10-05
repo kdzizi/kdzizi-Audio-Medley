@@ -94,6 +94,22 @@ PC 的 `server.js` 和手机里的 `ServerService` 是**同构**的（都是 170
 多端中控**不需要互斥开关**：它们都只是对同一个服务端发命令，靠 `/api/events` 保持同步即可。
 真正要互斥的是"谁是源"，由上面的 handover 流程保证。
 
+### 手机侧（APK）怎么用这套
+
+手机 `ServerService` 实现了同样的 `/api/who`、`/api/events`、`/api/handover`、`/api/resume`，
+所以两端可以互相接管/交还：
+
+| 场景 | 操作 | 背后做了什么 |
+|---|---|---|
+| 想用手机当源 | 主界面菜单 → **音频服务器** → 选曲 → 若局域网已有服务端会弹窗问 → **接管播放权** | 先读旧服务端的 `/api/status` 拿进度 → 本机起流并 seek 到同一位置 → 调旧服务端 `/api/handover?to=<本机IP>` |
+| 想把播放权还回去 | 菜单 → 音频服务器（已在放流）→ **交还 192.168.x.x** | 调旧服务端 `/api/resume` 让它起流 → 等它 1704 就绪 → 停本机服务 |
+| 不抢，只遥控 | 弹窗里选 **只当中控** | 不动任何服务端，把中控台指向已有的那台 |
+| 中控台顶部 | 常驻「当前服务端：谁」+「接管播放权 / 交还播放权」按钮 | 读 `/api/who`（follower 时显示 upstream），状态靠 `/api/events` 实时推 |
+
+**顺序一定是"先立后废"**（新源先起流 → 再让旧源退位）。反过来会有 1~2 秒没有源的真空期，
+客户端静音等待 + 重连抖动。客户端在这一刻会短暂断开，靠已实现的自动发现改连到新源
+（断流 1~2 秒）；**PC 上的 snapclient.exe 不会自动发现**，需要手动重启指向新源。
+
 ## 蓝牙音箱延迟补偿
 
 蓝牙链路自带 150~250ms 缓冲（JBL Flip 7 实测约 200ms），会让接蓝牙的那台设备慢半拍。
@@ -165,8 +181,11 @@ Chunk: <A age> <B miniMedian> <C shortMedian> <D median> <E bufferSize> <F dacTi
 `../snapdroid-app/` 是 snapdroid 0.29.0.2 的完整可编译工程，新增**中控台视图**（与 Web 控制台并存）：
 
 - `ControlActivity.java` — 中控：正在播放（歌名/歌手/可拖进度）、暂停/±10s、EQ 预设、
-  在线设备（单台音量/静音/声道角色 全频·低音炮·中高频），1s 轮询 `/api/status`
+  在线设备（单台音量/静音/声道角色 全频·低音炮·中高频）
 - 入口：主界面菜单 → **中控台**；host 与主界面设置共享，控制台端口固定 1780
+- 顶部一条**服务端角色栏**：「当前服务端：谁」+ 一键「接管播放权 / 交还播放权」
+- 状态同步订阅 `/api/events`（SSE 长连接，`HttpURLConnection` 流式读，无需引依赖），
+  3 秒轮询只作兜底
 - `AndroidManifest.xml` 开了 `usesCleartextTraffic`（明文 HTTP 必需）
 
 ### 编译（Android Studio）
@@ -184,14 +203,26 @@ Chunk: <A age> <B miniMedian> <C shortMedian> <D median> <E bufferSize> <F dacTi
 
 | 文件 | 改动 |
 |---|---|
-| `ControlActivity.java`（新增） | 中控视图本体 |
-| `LanScanner.java`（新增） | 局域网扫描兜底：并发探测子网的 1704，mDNS 不通时用它自动找服务端 |
-| `MainActivity.java` | 自动发现编排：mDNS 3 秒无果→扫描；旧 host 连不上→自动重找；resolve 用 IP 不用反解主机名 |
-| `res/layout/activity_control.xml`、`item_control_client.xml`（新增） | 中控布局 |
-| `AndroidManifest.xml` | 注册 ControlActivity + usesCleartextTraffic |
-| `menu_snapcast.xml` / `MainActivity.java` | 新增"中控台"菜单入口 |
-| `strings.xml` | action_control / title_activity_control |
+| `ControlActivity.java`（新增） | 中控视图本体 + 顶部服务端角色栏 + SSE 订阅 |
+| `ServerService.java`（新增） | 手机版 snapnode：1704 放流 + 1780 控制 API，并补齐角色端点（`/api/who`、`/api/events` SSE、`/api/handover`、`/api/resume`）、接管起始进度 `EXTRA_SEEK_SEC`、未握手连接不计在线设备 |
+| `utils/LanScanner.java`（新增） | 局域网扫描兜底：并发探测子网的 1704，mDNS 不通时用它自动找服务端；也提供 `localIpv4()` |
+| `utils/ServerHandover.java`（新增） | 移交编排：`probe` / `takeOver` / `handBack`，统一"先立后废"顺序，两个 Activity 共用 |
+| `MainActivity.java` | 自动发现编排（mDNS 3 秒无果→扫描；旧 host 连不上→自动重找）；起服务前先探局域网，有冲突弹「接管 / 只当中控 / 取消」；已在放流时给「交还 / 停止」 |
+| `res/layout/activity_control.xml`、`item_control_client.xml`（新增） | 中控布局（含角色栏） |
+| `AndroidManifest.xml` | 注册 ControlActivity + ServerService + usesCleartextTraffic |
+| `menu_snapcast.xml` / `MainActivity.java` | 新增"中控台"、"音频服务器"菜单入口 |
+| `strings.xml` | action_control / title_activity_control / action_server 等 |
 | `gradle-wrapper.properties` / `build.gradle` / `gradle.properties` | 国内镜像 + 凭证占位 |
+
+### 命令行编译（不用打开 Studio）
+
+本机 Studio 是便携版，自带 JBR 可直接当 JDK 用：
+
+```bash
+cd snapdroid-app
+JAVA_HOME=/c/Users/kdzizi/Desktop/Android-studio/jbr ./gradlew :Snapcast:assembleDebug
+adb install -r -t Snapcast/build/outputs/apk/debug/Snapcast-debug.apk   # debug 变体带 testOnly，必须加 -t
+```
 
 ## 已知现象
 

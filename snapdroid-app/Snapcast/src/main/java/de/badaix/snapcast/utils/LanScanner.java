@@ -104,6 +104,41 @@ public class LanScanner {
             pool.shutdownNow();
     }
 
+    /**
+     * 本机局域网 IPv4。优先 192.168.x（家庭 Wi-Fi / 安卓热点都是这个网段），
+     * 否则取第一个非回环 IPv4（如 iPhone 热点的 172.20.10.x）。
+     */
+    public static String localIpv4() {
+        try {
+            List<String> all = allIpv4();
+            for (String ip : all)
+                if (ip.startsWith("192.168."))
+                    return ip;
+            return all.isEmpty() ? "127.0.0.1" : all.get(0);
+        } catch (Exception e) {
+            return "127.0.0.1";
+        }
+    }
+
+    /** 本机所有非回环 IPv4 */
+    public static List<String> allIpv4() {
+        List<String> all = new ArrayList<>();
+        try {
+            Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces();
+            for (NetworkInterface ni : Collections.list(en)) {
+                if (!ni.isUp() || ni.isLoopback())
+                    continue;
+                for (InetAddress a : Collections.list(ni.getInetAddresses())) {
+                    if (!a.isLoopbackAddress() && a.getAddress().length == 4)
+                        all.add(a.getHostAddress());
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "allIpv4: " + e.getMessage());
+        }
+        return all;
+    }
+
     /** 本机所有 IPv4 接口所在的子网，展开成候选地址（跳过自身） */
     private List<String> candidates() {
         List<String> out = new ArrayList<>();

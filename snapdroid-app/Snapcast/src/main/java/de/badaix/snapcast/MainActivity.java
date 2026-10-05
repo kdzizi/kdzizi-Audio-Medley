@@ -68,6 +68,7 @@ import de.badaix.snapcast.control.json.Stream;
 import de.badaix.snapcast.control.json.Volume;
 import de.badaix.snapcast.utils.LanScanner;
 import de.badaix.snapcast.utils.NsdHelper;
+import de.badaix.snapcast.utils.ServerHandover;
 import de.badaix.snapcast.utils.Settings;
 
 public class MainActivity extends AppCompatActivity implements GroupItem.GroupItemListener, RemoteControl.RemoteControlListener, SnapclientService.SnapclientListener, NsdHelper.NsdHelperListener {
@@ -133,14 +134,17 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
                 } catch (Exception ignored) {
                 }
                 Settings.getInstance(this).put("server_track_uri", uri.toString());
-                startServerService(uri);
+                requestStartServer(uri);
             });
 
-    private void startServerService(Uri uri) {
+    private void startServerService(Uri uri, double seekSec) {
         Intent i = new Intent(this, ServerService.class);
         i.putExtra(ServerService.EXTRA_TRACK_URI, uri.toString());
+        if (seekSec > 0) i.putExtra(ServerService.EXTRA_SEEK_SEC, seekSec);
         ContextCompat.startForegroundService(this, i);
-        Toast.makeText(this, "服务器已启动（1704）。中控台填 127.0.0.1:1780", Toast.LENGTH_LONG).show();
+        Settings.getInstance(this).put("server_track_uri", uri.toString());
+        Toast.makeText(this, "服务器已启动（1704）。中控台填 "
+                + LanScanner.localIpv4() + ":1780", Toast.LENGTH_LONG).show();
     }
 
     /**
@@ -273,24 +277,9 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
             return true;
         } else if (id == R.id.action_server) {
             if (ServerService.isRunning()) {
-                stopService(new Intent(this, ServerService.class));
-                Toast.makeText(this, "音频服务器已停止", Toast.LENGTH_SHORT).show();
+                showServerRunningDialog();
             } else {
-                String last = Settings.getInstance(this).getString("server_track_uri", "");
-                if (!last.isEmpty()) {
-                    new androidx.appcompat.app.AlertDialog.Builder(this)
-                            .setTitle("音频服务器")
-                            .setItems(new CharSequence[]{"播放上次曲目", "选择其他音频文件"},
-                                    (d, w) -> {
-                                        if (w == 0)
-                                            startServerService(Uri.parse(last));
-                                        else
-                                            openTrackLauncher.launch(new String[]{"audio/*"});
-                                    })
-                            .show();
-                } else {
-                    openTrackLauncher.launch(new String[]{"audio/*"});
-                }
+                chooseTrackThenStart();
             }
             return true;
         } else if (id == R.id.action_about) {
@@ -299,6 +288,105 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
         }
 
         return super.onOptionsItemSelected(item);
+    }
+
+    // ================= 服务端角色：起流前的探测 / 接管 / 交还 =================
+
+    /** 本机已在放流时点菜单：停掉，或把播放权交还给局域网里的其他设备 */
+    private void showServerRunningDialog() {
+        final String remote = Settings.getInstance(this).getString("handover_remote", "");
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("本机正在当服务端")
+                .setMessage("其他设备连的是本机 " + LanScanner.localIpv4() + ":1704。"
+                        + (TextUtils.isEmpty(remote) ? "" : "\n\n上次是从 " + remote + " 接管过来的。"))
+                .setPositiveButton("停止服务器", (d, w) -> {
+                    stopService(new Intent(this, ServerService.class));
+                    Toast.makeText(this, "音频服务器已停止", Toast.LENGTH_SHORT).show();
+                })
+                .setNeutralButton(TextUtils.isEmpty(remote) ? "交还播放权…" : "交还 " + remote,
+                        (d, w) -> handBackToRemote())
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void chooseTrackThenStart() {
+        String last = Settings.getInstance(this).getString("server_track_uri", "");
+        if (!last.isEmpty()) {
+            new androidx.appcompat.app.AlertDialog.Builder(this)
+                    .setTitle("音频服务器")
+                    .setItems(new CharSequence[]{"播放上次曲目", "选择其他音频文件"},
+                            (d, w) -> {
+                                if (w == 0)
+                                    requestStartServer(Uri.parse(last));
+                                else
+                                    openTrackLauncher.launch(new String[]{"audio/*"});
+                            })
+                    .show();
+        } else {
+            openTrackLauncher.launch(new String[]{"audio/*"});
+        }
+    }
+
+    /**
+     * 起本机服务前先扫一遍局域网：已经有服务端就不抢，问清楚是"接管"还是"只当中控"。
+     * 这就是服务端的自动退让规则在手机侧的对应物（PC 端是启动时自己探）。
+     */
+    private void requestStartServer(final Uri uri) {
+        Toast.makeText(this, "检查局域网里是否已有服务端…", Toast.LENGTH_SHORT).show();
+        ServerHandover.probe(ServerHandover.STREAM_PORT, ip -> runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            if (ip == null) {
+                startServerService(uri, -1);
+                return;
+            }
+            new androidx.appcompat.app.AlertDialog.Builder(MainActivity.this)
+                    .setTitle("局域网已有服务端 " + ip)
+                    .setMessage("现在直接起本机服务会出现两个 1704，客户端连到谁全看运气。\n\n"
+                            + "• 接管播放权：本机先起流（接上它的播放进度），再让它退位。"
+                            + "断流 1~2 秒，客户端自动切过来。\n"
+                            + "• 只当中控：不动它，把中控台指向它。")
+                    .setPositiveButton("接管播放权", (d, w) -> doTakeOver(uri, ip))
+                    .setNeutralButton("只当中控", (d, w) -> pointControlAt(ip))
+                    .setNegativeButton("取消", null)
+                    .show();
+        }));
+    }
+
+    private void doTakeOver(Uri uri, final String ip) {
+        Settings.getInstance(this).put("handover_remote", ip);  // 记着"以后交还给谁"
+        Toast.makeText(this, "正在接管 " + ip + " 的播放权…", Toast.LENGTH_SHORT).show();
+        ServerHandover.takeOver(this, ip, ServerHandover.HTTP_PORT, uri, (ok, msg) -> runOnUiThread(() -> {
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+            if (!ok) return;
+            // 本机成了源：本机客户端也连自己，否则这台手机反而不出声
+            String me = LanScanner.localIpv4();
+            setHost(me, ServerHandover.STREAM_PORT, ServerHandover.STREAM_PORT + 1);
+            startRemoteControl();
+            if (Settings.getInstance(this).isAutostart()) startSnapclient();
+        }));
+    }
+
+    private void handBackToRemote() {
+        final String remote = Settings.getInstance(this).getString("handover_remote", "");
+        if (TextUtils.isEmpty(remote)) {
+            Toast.makeText(this, "没记录接管前的服务端；直接停本机服务器", Toast.LENGTH_LONG).show();
+            stopService(new Intent(this, ServerService.class));
+            return;
+        }
+        Toast.makeText(this, "正在交还播放权给 " + remote + "…", Toast.LENGTH_SHORT).show();
+        ServerHandover.handBack(this, remote, ServerHandover.HTTP_PORT, (ok, msg) -> runOnUiThread(() -> {
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+            if (!ok) return;
+            setHost(remote, ServerHandover.STREAM_PORT, ServerHandover.STREAM_PORT + 1);
+            startRemoteControl();
+        }));
+    }
+
+    /** 不抢，只把中控台指向已有的那台 */
+    private void pointControlAt(String ip) {
+        setHost(ip, ServerHandover.STREAM_PORT, ServerHandover.STREAM_PORT + 1);
+        startRemoteControl();
+        startActivity(new Intent(this, ControlActivity.class));
     }
 
     private void updateStartStopMenuItem() {
@@ -444,12 +532,6 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
     }
 
     @Override
-    public void onStop() {
-        stopAutoDiscovery();
-        super.onStop();
-    }
-
-    @Override
     public void onDestroy() {
         stopRemoteControl();
         super.onDestroy();
@@ -457,9 +539,9 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
 
     @Override
     public void onStop() {
+        stopAutoDiscovery();
         super.onStop();
 
-        NsdHelper.getInstance(this).stopListening();
 // Unbind from the service
         if (bound) {
             unbindService(mConnection);
