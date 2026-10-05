@@ -68,16 +68,25 @@ dependencies {
 
 
 repositories{
+    // 本地 libs/ 里已 vendored 全部 8 个 prefab aar（oboe/boost/flac/ogg/opus/soxr/tremor/vorbis，
+    // 取自 github.com/snapcast/snapcast-deps release v0.29.0），flatDir 优先命中，无需任何远程仓库。
+    // 若 libs/ 缺文件，按 libs/readme.txt 里的链接手动补齐后重跑 Sync。
     flatDir{
         dirs 'libs'
     }
 
-    maven {
-        name = "GithubPackages"
-        url = uri("https://maven.pkg.github.com/badaix/snapcast-deps")
-        credentials {
-            username = project.findProperty("GITHUB_USER") ?: System.getenv("GITHUB_USER")
-            password = project.findProperty("GITHUB_TOKEN") ?: System.getenv("GITHUB_TOKEN")
+    // GitHub Packages 仅在配置了凭证时启用（未配置时注册 null credentials 会 NPE：
+    // "Username must not be null!"）
+    def ghUser = project.findProperty("GITHUB_USER") ?: System.getenv("GITHUB_USER")
+    def ghToken = project.findProperty("GITHUB_TOKEN") ?: System.getenv("GITHUB_TOKEN")
+    if (ghUser && ghToken) {
+        maven {
+            name = "GithubPackages"
+            url = uri("https://maven.pkg.github.com/badaix/snapcast-deps")
+            credentials {
+                username = ghUser
+                password = ghToken
+            }
         }
     }
 }

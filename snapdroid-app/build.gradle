@@ -4,14 +4,12 @@
 
 buildscript {
     repositories {
+        // 国内镜像前置；aliyun 未命中的回落 google()/mavenCentral()
+        // 注意：不要写显式 https://maven.google.com —— 直连被墙，每个未命中依赖都要等 20s 超时
         maven { url 'https://maven.aliyun.com/repository/google' }
         maven { url 'https://maven.aliyun.com/repository/public' }
         maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
         mavenCentral()
-        maven {
-            url 'https://maven.google.com/'
-            name 'Google'
-        }
         google()
     }
     dependencies {
@@ -27,10 +25,7 @@ allprojects {
         maven { url 'https://maven.aliyun.com/repository/google' }
         maven { url 'https://maven.aliyun.com/repository/public' }
         mavenCentral()
-        maven {
-            url 'https://maven.google.com/'
-            name 'Google'
-        }
+        google()
     }
 }
 
