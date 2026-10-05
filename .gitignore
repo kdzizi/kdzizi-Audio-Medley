@@ -1,0 +1,33 @@
+# 音频素材（大文件，不进库；gen-wav.js 可重新生成测试音）
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# 客户端安装包（Snapcast.apk 通过 /apk 路由分发，可从 GitHub release 重新下载）
+*.apk
+
+# 下载与压缩包
+*.zip
+*.tgz
+ff.tgz
+rel.json
+sd.json
+lyric.json
+pts.json
+stats*.txt
+
+# 第三方源码解压（引用自 snapcast/snapdroid 上游，不修改）
+ffmpeg/
+snapclient/
+src/
+src29/
+sdsrc/
+
+# 截图与临时产物
+*.png
+blobs/
+
+# 个人工作区数据
+.workbuddy/
+ui.xml

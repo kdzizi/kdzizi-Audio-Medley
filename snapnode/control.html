@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Snapcast 控制台</title>
+<style>
+  :root{ --bd:#dfe3e8; --bg:#f4f5f7; --fg:#171b21; --mut:#6b7280; --acc:#2563eb; --acc2:#eaf1fd; }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  body{margin:0;padding:16px;max-width:760px;margin:0 auto;font:15px/1.5 -apple-system,"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;background:var(--bg);color:var(--fg)}
+  h1{font-size:17px;margin:0}
+  .top{display:flex;justify-content:space-between;align-items:baseline;margin:4px 2px 14px}
+  .top .sub{color:var(--mut);font-size:12px}
+  .card{background:#fff;border:1px solid var(--bd);border-radius:10px;padding:16px;margin-bottom:12px}
+  .song{font-size:20px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .meta{color:var(--mut);font-size:12.5px;margin-top:2px}
+  .prog{display:flex;align-items:center;gap:10px;margin:14px 0 4px}
+  .prog input{flex:1}
+  .t{font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums;min-width:38px;text-align:center}
+  .ctrl{display:flex;gap:10px;justify-content:center;margin-top:12px}
+  button{border:1px solid var(--bd);background:#fff;color:var(--fg);border-radius:10px;cursor:pointer;font-size:15px;padding:0 18px;height:44px}
+  button:active{background:var(--acc2)}
+  .big{background:var(--acc);border-color:var(--acc);color:#fff;min-width:110px;font-size:16px}
+  .big.paused{background:#fff;color:var(--acc)}
+  .dev{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid #eef0f3}
+  .dev:last-child{border-bottom:0}
+  .dname{font-weight:500;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tag{font-size:11px;color:var(--mut);border:1px solid var(--bd);padding:1px 6px;border-radius:6px;white-space:nowrap}
+  input[type=range]{accent-color:var(--acc);height:32px}
+  .vol{flex:1;min-width:90px;max-width:220px}
+  .val{width:34px;text-align:right;color:var(--mut);font-variant-numeric:tabular-nums;font-size:13px}
+  .mute{height:32px;padding:0 12px;font-size:13px;border-radius:8px}
+  .mute.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+  .empty{color:var(--mut);padding:10px 0}
+  .hint{color:var(--mut);font-size:12px;margin:14px 4px;line-height:1.6}
+  code{background:#eceff3;padding:1px 5px;border-radius:4px;font-size:12px}
+  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .bar button{height:36px;font-size:13px;padding:0 14px}
+  .bar button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>Snapcast 控制台</h1>
+  <span class="sub" id="srv">连接中…</span>
+</div>
+
+<div class="card" style="background:var(--acc2);border-color:#c9daf7">
+  <div style="font-weight:500;font-size:14px">新设备接入</div>
+  <div style="font-size:13px;color:var(--mut);margin-top:2px">手机连同一 WiFi，浏览器打开本页地址 + <code>/apk</code> 下载安装 Snapcast 客户端，装好后打开 App 在设置里把 Host 填成 <code id="iphint">…</code></div>
+</div>
+
+<div class="card">
+  <div class="song" id="song">—</div>
+  <div class="meta" id="meta"></div>
+  <div class="prog">
+    <span class="t" id="tcur">0:00</span>
+    <input type="range" id="pos" min="0" max="100" value="0" step="1">
+    <span class="t" id="tdur">0:00</span>
+  </div>
+  <div class="ctrl">
+    <button id="back" title="快退10秒">−10s</button>
+    <button class="big" id="play">暂停</button>
+    <button id="fwd" title="快进10秒">+10s</button>
+  </div>
+</div>
+
+<div class="card">
+  <div style="font-weight:500;margin-bottom:10px">音效 <span class="tag" id="eqtag">EQ 0/0/0</span></div>
+  <div class="bar" style="margin-bottom:12px" id="presets">
+    <button data-p="flat">原声</button>
+    <button data-p="bass">低音增强</button>
+    <button data-p="vocal">人声</button>
+    <button data-p="treble">高音</button>
+    <button data-p="warm">温暖</button>
+  </div>
+  <div class="row" style="border:0;padding:6px 0"><span class="dname" style="min-width:56px">低频</span><input type="range" id="eqL" min="-12" max="12" step="1" value="0"><span class="val" id="eqLv">0</span></div>
+  <div class="row" style="border:0;padding:6px 0"><span class="dname" style="min-width:56px">中频</span><input type="range" id="eqM" min="-12" max="12" step="1" value="0"><span class="val" id="eqMv">0</span></div>
+  <div class="row" style="border:0;padding:6px 0"><span class="dname" style="min-width:56px">高频</span><input type="range" id="eqH" min="-12" max="12" step="1" value="0"><span class="val" id="eqHv">0</span></div>
+</div>
+
+<div class="card">
+  <div style="font-weight:500;margin-bottom:2px">在线设备 <span class="tag" id="cnt">0</span></div>
+  <div id="list"><div class="empty">等待设备连接…</div></div>
+</div>
+
+<div class="card">
+  <div style="font-weight:500;margin-bottom:10px">全局操作</div>
+  <div class="bar">
+    <input type="range" id="gv" min="0" max="100" value="100" style="flex:1;min-width:120px">
+    <span class="val" id="gvv">100</span>
+    <button id="gm">全部静音</button>
+    <button id="gzero">延迟归零</button>
+  </div>
+</div>
+
+<div class="hint">
+  播放本身由各设备上的 Snapcast 客户端完成（后台服务），此页面是遥控器，可开在任何设备的浏览器。
+  实时同步流没有"倍速"——所有设备对齐的是同一个时间轴，可用的操作是暂停和快进快退。
+  「延迟归零」用于同步听诊实验后复位。
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const fmtT = s => Math.floor(s/60) + ':' + String(Math.floor(s%60)).padStart(2,'0');
+let pos = { sec: 0, dur: 1, dragging: false, paused: false };
+
+async function api(u){ const r = await fetch(u); return r.json(); }
+
+async function render(){
+  let s;
+  try { s = await api('/api/status'); } catch(e){ $('#srv').textContent = '服务端未响应'; return; }
+  $('#srv').textContent = s.server.host;
+  $('#iphint').textContent = s.server.host;
+
+  const eq = s.eq;
+  $('#eqL').value = eq.low; $('#eqM').value = eq.mid; $('#eqH').value = eq.high;
+  $('#eqLv').textContent = eq.low; $('#eqMv').textContent = eq.mid; $('#eqHv').textContent = eq.high;
+  $('#eqtag').textContent = `EQ ${eq.low}/${eq.mid}/${eq.high}`;
+
+  const m = s.media;
+  $('#song').textContent = m.name;
+  $('#meta').textContent = (m.artist ? m.artist + ' · ' : '') + '总时长 ' + fmtT(m.durationSec) + (m.paused ? ' · 已暂停' : ' · 播放中');
+  $('#tdur').textContent = fmtT(m.durationSec);
+  $('#play').textContent = m.paused ? '播放' : '暂停';
+  $('#play').classList.toggle('paused', m.paused);
+  pos.sec = m.positionSec; pos.dur = m.durationSec; pos.paused = m.paused;
+  if (!pos.dragging) $('#pos').value = Math.round(m.positionSec / m.durationSec * 100);
+  $('#tcur').textContent = fmtT(m.positionSec);
+
+  $('#cnt').textContent = s.clients.length;
+  const list = $('#list');
+  if (!s.clients.length) { list.innerHTML = '<div class="empty">还没有设备连上。App 里 Host 填 <code>'+s.server.host+'</code></div>'; }
+  else list.innerHTML = s.clients.map(c => `
+    <div class="dev">
+      <span class="dname">${c.name}</span>
+      <span class="tag">${c.os || '?'}</span>
+      <span class="tag" title="时钟抖动，越小越稳">${c.jitter}ms</span>
+      <input type="range" class="vol" min="0" max="100" value="${c.volume}" data-id="${c.id}">
+      <span class="val">${c.volume}</span>
+      <button class="mute ${c.muted?'on':''}" data-mute="${c.id}">${c.muted?'有声':'静音'}</button>
+      <select data-band="${c.id}" style="height:32px;border:1px solid var(--bd);border-radius:8px;font-size:13px" title="频段角色">
+        <option value="full" ${c.band==='full'?'selected':''}>全频</option>
+        <option value="low" ${c.band==='low'?'selected':''}>低音炮</option>
+        <option value="high" ${c.band==='high'?'selected':''}>中高频</option>
+      </select>
+    </div>`).join('');
+
+  list.querySelectorAll('.vol').forEach(el => {
+    el.oninput = () => { el.nextElementSibling.textContent = el.value; };
+    el.onchange = async () => { await api('/api/vol?id='+el.dataset.id+'&v='+el.value); };
+  });
+  list.querySelectorAll('.mute').forEach(b => {
+    b.onclick = async () => { await api('/api/mute?id='+b.dataset.mute); render(); };
+  });
+  list.querySelectorAll('select[data-band]').forEach(sel => {
+    sel.onchange = async () => { await api('/api/band?id='+sel.dataset.band+'&band='+sel.value); };
+  });
+}
+
+document.querySelectorAll('#presets button').forEach(b => {
+  b.onclick = async () => { await api('/api/eq?preset='+b.dataset.p); render(); };
+});
+[['eqL','low'],['eqM','mid'],['eqH','high']].forEach(([id,k]) => {
+  const el = $('#'+id);
+  el.oninput = () => $('#'+id+'v').textContent = el.value;
+  el.onchange = async () => { await api('/api/eq?'+k+'='+el.value); render(); };
+});
+
+$('#play').onclick = async () => { await api('/api/pause?p='+(pos.paused?0:1)); render(); };
+$('#back').onclick = async () => { await api('/api/seek?sec=-10'); render(); };
+$('#fwd').onclick  = async () => { await api('/api/seek?sec=10'); render(); };
+$('#pos').oninput  = () => { pos.dragging = true; $('#tcur').textContent = fmtT(Math.round($('#pos').value/100*pos.dur)); };
+$('#pos').onchange = async () => { pos.dragging = false; await api('/api/seek?sec=' + Math.round($('#pos').value/100*pos.dur) ); render(); };
+
+$('#gv').oninput = () => $('#gvv').textContent = $('#gv').value;
+$('#gv').onchange = async () => { await api('/api/vol?v='+$('#gv').value); render(); };
+$('#gm').onclick = async () => { await api('/api/mute'); render(); };
+$('#gzero').onclick = async () => {
+  for (const el of document.querySelectorAll('.vol')) await api('/api/offset?id='+el.dataset.id+'&ms=0');
+  render();
+};
+
+render(); setInterval(render, 2000);
+</script>
+</body>
+</html>
