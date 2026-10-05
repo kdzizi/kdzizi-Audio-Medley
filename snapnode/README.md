@@ -221,8 +221,11 @@ Chunk: <A age> <B miniMedian> <C shortMedian> <D median> <E bufferSize> <F dacTi
 ```bash
 cd snapdroid-app
 JAVA_HOME=/c/Users/kdzizi/Desktop/Android-studio/jbr ./gradlew :Snapcast:assembleDebug
-adb install -r -t Snapcast/build/outputs/apk/debug/Snapcast-debug.apk   # debug 变体带 testOnly，必须加 -t
+adb install -r Snapcast/build/outputs/apk/debug/Snapcast-debug.apk
+# 若报 INSTALL_FAILED_TEST_ONLY（Studio Run 注入的包才会带），再加 -t
 ```
+
+> JAVA_HOME 用正斜杠：Git Bash 里 `\U`、`\A` 会被当转义吃掉。
 
 ## 已知现象
 
