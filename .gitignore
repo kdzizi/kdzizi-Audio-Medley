@@ -43,3 +43,6 @@ blobs/
 # 个人工作区数据
 .workbuddy/
 ui.xml
+
+# 运行日志
+snapnode/*.log

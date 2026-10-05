@@ -8,6 +8,10 @@
 
 - `server.js` — 服务端（1704 stream / 1705 control / 1780 网页控制台）
 - `control.html` — 浏览器控制台（任何设备的浏览器都能开，见下）
+- `mdns.js` — 零依赖 mDNS/DNS-SD 广播（发布 `_snapcast._tcp`，供客户端自动发现）
+- `test-mdns.js` — 发现自检：模拟客户端发 PTR/SRV/TXT/A 查询，看服务端答了什么
+- `start-server.bat` — 双击启动（默认播 `../ncm.wav`，也可拖一个 wav 到图标上）
+- `start-pc-client.bat` — 双击启动 PC 端 snapclient（默认 `--latency 200` 补蓝牙延迟）
 - `gen-wav.js` — 生成同步测试音频（48kHz/16bit/立体声，每秒左右交替 click + 每 4 秒强拍 + 和弦垫）
 - `sync-test.wav` — 生成的测试音，30 秒循环播放
 - `../song.mp3` / `../song.wav` — 真实歌曲测试素材（SoundHelix-Song-1，6 分 12 秒，44.1kHz 立体声）
@@ -28,6 +32,28 @@ node server.js ../song.wav 1704
 
 平板装 Snapcast App（snapdroid），设置 → Host 填电脑 IP → 点播放。
 PC 装 snapclient.exe：`snapclient.exe tcp://<电脑IP>:1704`
+
+## 自动发现（不用每换一次网络就手填 host）
+
+服务端启动后会**发布 mDNS 服务** `_snapcast._tcp`（+ `_snapcast-jsonrpc` 1705、`_snapcast-http` 1780），
+实例名 `Snapcast`——和官方 snapserver 一致。客户端侧的自动查找逻辑（新版 APK）：
+
+1. **mDNS 先搜**（`NsdHelper`，3 秒）
+2. 没结果 → **并发扫描局域网**：探测本机子网的 1704 端口，谁开着谁是 Snapserver
+   （`/24` 子网 254 个地址、64 并发、400ms 超时，实测 0.4 秒内出结果）
+3. 找到后自动写入 host 并连接；**旧 host 连不上**（换热点/服务端没开）也会自动重找
+
+为什么两套都要：
+
+- mDNS 是标准做法，但在**手机热点 / 开了 AP 隔离的路由器**上组播常被禁，扫不到；
+- 另外 Windows 上 5353 端口常被 Bonjour、浏览器等多个进程共享占用，
+  组播查询包不一定投递到本进程的 socket（实测多次收不到），应答就发不出去。
+  所以扫描兜底才是真正稳定的那条路。
+
+自检：`node test-mdns.js` 会模拟客户端发一轮查询并打印服务端应答；
+服务端日志里 `[mdns ] query from x.x.x.x` 表示确实收到了查询。
+
+> 未握手的 TCP 连接（扫描探针）不会进在线设备列表——`hello` 之后才算在线。
 
 ## 网页控制台（1780）
 
@@ -130,6 +156,8 @@ Chunk: <A age> <B miniMedian> <C shortMedian> <D median> <E bufferSize> <F dacTi
 | 文件 | 改动 |
 |---|---|
 | `ControlActivity.java`（新增） | 中控视图本体 |
+| `LanScanner.java`（新增） | 局域网扫描兜底：并发探测子网的 1704，mDNS 不通时用它自动找服务端 |
+| `MainActivity.java` | 自动发现编排：mDNS 3 秒无果→扫描；旧 host 连不上→自动重找；resolve 用 IP 不用反解主机名 |
 | `res/layout/activity_control.xml`、`item_control_client.xml`（新增） | 中控布局 |
 | `AndroidManifest.xml` | 注册 ControlActivity + usesCleartextTraffic |
 | `menu_snapcast.xml` / `MainActivity.java` | 新增"中控台"菜单入口 |

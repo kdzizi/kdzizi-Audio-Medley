@@ -31,7 +31,9 @@ import android.net.Uri;
 import android.net.nsd.NsdServiceInfo;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.Menu;
@@ -54,6 +56,7 @@ import com.google.android.material.snackbar.Snackbar;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 
@@ -63,6 +66,7 @@ import de.badaix.snapcast.control.json.Group;
 import de.badaix.snapcast.control.json.ServerStatus;
 import de.badaix.snapcast.control.json.Stream;
 import de.badaix.snapcast.control.json.Volume;
+import de.badaix.snapcast.utils.LanScanner;
 import de.badaix.snapcast.utils.NsdHelper;
 import de.badaix.snapcast.utils.Settings;
 
@@ -89,6 +93,11 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
     private CoordinatorLayout coordinatorLayout;
     private Button btnConnect = null;
     private boolean batchActive = false;
+
+    // ---- 自动发现：mDNS 优先，失败则并发扫描局域网（热点/AP 隔离环境下 mDNS 常常不通）----
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private boolean autoDiscovering = false;
+    private LanScanner lanScanner = null;
 
     private final ActivityResultLauncher<String> requestPermissionLauncher =
             registerForActivityResult(new ActivityResultContracts.RequestPermission(), isGranted -> {
@@ -356,13 +365,88 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
     public void onStart() {
         super.onStart();
 
-        if (TextUtils.isEmpty(Settings.getInstance(this).getHost()))
-            NsdHelper.getInstance(this).startListening("_snapcast._tcp.", SERVICE_NAME, this);
-        else
-            setHost(Settings.getInstance(this).getHost(), Settings.getInstance(this).getStreamPort(), Settings.getInstance(this).getControlPort());
+        final String savedHost = Settings.getInstance(this).getHost();
+        if (TextUtils.isEmpty(savedHost)) {
+            startAutoDiscovery();
+        } else {
+            setHost(savedHost, Settings.getInstance(this).getStreamPort(), Settings.getInstance(this).getControlPort());
+            // 换了网络（户外热点）旧 host 可能已经失效：5 秒还没连上就自动重新找
+            mainHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if ((remoteControl == null) || (!remoteControl.isConnected()))
+                        startAutoDiscovery();
+                }
+            }, 5000);
+        }
 
         Intent intent = new Intent(this, SnapclientService.class);
         bindService(intent, mConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    /** mDNS 先搜，4 秒没结果就扫描局域网兜底 */
+    private void startAutoDiscovery() {
+        stopAutoDiscovery();
+        autoDiscovering = true;
+        setActionbarSubtitle("searching for Snapserver...");
+        try {
+            NsdHelper.getInstance(this).startListening("_snapcast._tcp.", SERVICE_NAME, this);
+        } catch (Exception e) {
+            Log.w(TAG, "nsd start failed: " + e.getMessage());
+        }
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                startLanScan();
+            }
+        }, 3000);
+    }
+
+    private void startLanScan() {
+        if (!autoDiscovering)
+            return;
+        final int streamPort = Settings.getInstance(this).getStreamPort();
+        lanScanner = new LanScanner(streamPort, new LanScanner.Listener() {
+            @Override
+            public void onFound(final String host, final int port) {
+                stopAutoDiscovery();
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        MainActivity.this.setHost(host, port, port + 1);
+                        startRemoteControl();
+                        if (Settings.getInstance(MainActivity.this).isAutostart())
+                            startSnapclient();
+                    }
+                });
+            }
+
+            @Override
+            public void onFinished(final boolean found) {
+                if (!found && autoDiscovering)
+                    setActionbarSubtitle("no Snapserver found");
+            }
+        });
+        lanScanner.start();
+    }
+
+    private void stopAutoDiscovery() {
+        autoDiscovering = false;
+        mainHandler.removeCallbacksAndMessages(null);
+        if (lanScanner != null) {
+            lanScanner.cancel();
+            lanScanner = null;
+        }
+        try {
+            NsdHelper.getInstance(this).stopListening();
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    public void onStop() {
+        stopAutoDiscovery();
+        super.onStop();
     }
 
     @Override
@@ -541,9 +625,14 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
     @Override
     public void onResolved(NsdHelper nsdHelper, NsdServiceInfo serviceInfo) {
         Log.d(TAG, "resolved: " + serviceInfo);
-        setHost(serviceInfo.getHost().getCanonicalHostName(), serviceInfo.getPort(), serviceInfo.getPort() + 1);
+        // 用 IP 而不是 getCanonicalHostName()：后者会做反向 DNS，热点里可能长时间卡住或返回空
+        InetAddress addr = serviceInfo.getHost();
+        String resolved = (addr != null) ? addr.getHostAddress() : "";
+        if (TextUtils.isEmpty(resolved))
+            return;
+        stopAutoDiscovery();
+        setHost(resolved, serviceInfo.getPort(), serviceInfo.getPort() + 1);
         startRemoteControl();
-        NsdHelper.getInstance(this).stopListening();
     }
 
 
@@ -649,6 +738,16 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
             setActionbarSubtitle("not connected");
         }
         updateMenuItems(false);
+
+        // 连不上（服务端没开 / 换网络后 IP 变了）：3 秒后自动重新找，不用进设置手填
+        if ((e != null) && !autoDiscovering) {
+            mainHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    startAutoDiscovery();
+                }
+            }, 3000);
+        }
     }
 
 

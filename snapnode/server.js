@@ -273,7 +273,7 @@ function tick() {
 
 // ---------- stream 端口 ----------
 const stream = net.createServer(sock => {
-  const info = { id: ++clientSeq, addr: sock.remoteAddress, version: '?', os: '?', name: '?', diff: 0, diffs: [], jitter: 0, drift: 0, volume: 100, muted: false, offsetMs: 0, band: 'full', bandF: null };
+  const info = { id: ++clientSeq, addr: sock.remoteAddress, version: '?', os: '?', name: '?', diff: 0, diffs: [], jitter: 0, drift: 0, volume: 100, muted: false, offsetMs: 0, band: 'full', bandF: null, ready: false };
   clients.set(sock, info);
   console.log(`[+] client #${info.id} ${sock.remoteAddress}:${sock.remotePort}  (当前 ${clients.size} 台)`);
 
@@ -310,6 +310,7 @@ function handle(sock, info, msg) {
     info.name = h.HostName || h.ClientName || '?';
     info.proto = h.SnapStreamProtocolVersion || 1;
     console.log(`    hello from #${info.id}: ${info.name} v${info.version} ${info.os} proto=${info.proto}`);
+    info.ready = true; // 握手后才算在线设备（局域网扫描的探测连接不会污染列表）
     // 关键：ServerSettings 的 refersTo 必须 = Hello 请求的 id，客户端按此匹配请求（2s 超时）
     sendSettings(sock, info, id);
     broadcast(CODEC_HEADER_MSG(), sock);
@@ -383,7 +384,8 @@ const HTTP_PORT = 1780;
 const state = { paused: false };
 
 function clientList() {
-  return [...clients.values()].map(c => ({
+  // ready=false 的是"只连了 TCP 还没握手"的连接（如局域网扫描的探测），不计入在线设备
+  return [...clients.values()].filter(c => c.ready).map(c => ({
     id: c.id, name: c.name || ('client-' + c.id), addr: c.addr, os: c.os,
     version: c.version, volume: c.volume, muted: c.muted,
     jitter: +c.jitter.toFixed(2), drift: +c.drift.toFixed(2), samples: c.diffs.length, offsetMs: c.offsetMs | 0, band: c.band,
@@ -488,3 +490,15 @@ nextChunkAudio = function () {
 httpSrv.listen(HTTP_PORT, '0.0.0.0', () => {
   console.log(`[http ] 控制页 http://${LOCAL_IP}:${HTTP_PORT}/`);
 });
+
+// ---------- mDNS 广播（局域网自动发现，客户端不用手填 host） ----------
+// 官方 snapserver 用 avahi/bonjour 发这几条；这里用 mdns.js 自己发，零依赖
+try {
+  const mdns = require('./mdns');
+  const txt = { version: '0.29.0-node', control: String(CONTROL_PORT), http: String(HTTP_PORT) };
+  mdns.publish({ instance: 'Snapcast', type: '_snapcast._tcp', port: PORT, ip: LOCAL_IP, txt });
+  mdns.publish({ instance: 'Snapcast', type: '_snapcast-jsonrpc._tcp', port: CONTROL_PORT, ip: LOCAL_IP, txt });
+  mdns.publish({ instance: 'Snapcast', type: '_snapcast-http._tcp', port: HTTP_PORT, ip: LOCAL_IP, txt });
+} catch (e) {
+  console.log('[mdns ] 发布失败:', e.message);
+}
