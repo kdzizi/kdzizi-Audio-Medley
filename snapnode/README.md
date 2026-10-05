@@ -105,6 +105,37 @@ Chunk: <A age> <B miniMedian> <C shortMedian> <D median> <E bufferSize> <F dacTi
   说明它的时钟同步闭环真的在工作——持续测量偏差并微调播放速率。归零后声音重新合成一个干净人声。
   这是验证"系统确实在同步"最直接的 A/B 对照。
 
+## 安卓 App 二次开发（snapdroid-app/）
+
+`../snapdroid-app/` 是 snapdroid 0.29.0.2 的完整可编译工程，新增**中控台视图**（与 Web 控制台并存）：
+
+- `ControlActivity.java` — 中控：正在播放（歌名/歌手/可拖进度）、暂停/±10s、EQ 预设、
+  在线设备（单台音量/静音/声道角色 全频·低音炮·中高频），1s 轮询 `/api/status`
+- 入口：主界面菜单 → **中控台**；host 与主界面设置共享，控制台端口固定 1780
+- `AndroidManifest.xml` 开了 `usesCleartextTraffic`（明文 HTTP 必需）
+
+### 编译（Android Studio）
+
+1. Studio 打开 `snapdroid-app/` 目录（首次 sync 自动生成 `local.properties`）
+2. **GitHub Packages 凭证**：oboe/boost/flac/opus 等 native AAR 托管在
+   `maven.pkg.github.com/badaix/snapcast-deps`，需要 PAT（勾 `read:packages`）。
+   填在 `gradle.properties` 的 `GITHUB_USER` / `GITHUB_TOKEN`，或环境变量
+3. SDK 组件：compileSdk 35 + build-tools 35.0.0 + **NDK 27.2.12479018** + **CMake 3.22.1**
+   （工程含 native C++ client，缺什么 Studio 会提示）
+4. 构建配置已做国内适配：Gradle wrapper 8.11.1 **-all** 走腾讯云镜像、Maven 走阿里云
+5. `Build → Build APK(s)` 产物：`Snapcast/build/outputs/apk/debug/`
+
+### 与原版 snapdroid 的差异（全部可 grep `snapnode` 定位）
+
+| 文件 | 改动 |
+|---|---|
+| `ControlActivity.java`（新增） | 中控视图本体 |
+| `res/layout/activity_control.xml`、`item_control_client.xml`（新增） | 中控布局 |
+| `AndroidManifest.xml` | 注册 ControlActivity + usesCleartextTraffic |
+| `menu_snapcast.xml` / `MainActivity.java` | 新增"中控台"菜单入口 |
+| `strings.xml` | action_control / title_activity_control |
+| `gradle-wrapper.properties` / `build.gradle` / `gradle.properties` | 国内镜像 + 凭证占位 |
+
 ## 已知现象
 
 - 蓝牙音箱（如 JBL）链路自身延迟约 200ms，比有线/内置喇叭慢半拍。
