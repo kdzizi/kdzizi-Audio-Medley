@@ -113,6 +113,26 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
         }
     }
 
+    // ---- 本机音频服务器（户外中控场景）----
+    private final ActivityResultLauncher<String[]> openTrackLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
+                if (uri == null) return;
+                try {
+                    getContentResolver().takePersistableUriPermission(uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (Exception ignored) {
+                }
+                Settings.getInstance(this).put("server_track_uri", uri.toString());
+                startServerService(uri);
+            });
+
+    private void startServerService(Uri uri) {
+        Intent i = new Intent(this, ServerService.class);
+        i.putExtra(ServerService.EXTRA_TRACK_URI, uri.toString());
+        ContextCompat.startForegroundService(this, i);
+        Toast.makeText(this, "服务器已启动（1704）。中控台填 127.0.0.1:1780", Toast.LENGTH_LONG).show();
+    }
+
     /**
      * Defines callbacks for service binding, passed to bindService()
      */
@@ -240,6 +260,28 @@ public class MainActivity extends AppCompatActivity implements GroupItem.GroupIt
             remoteControl.getServerStatus();
         } else if (id == R.id.action_control) {
             startActivity(new Intent(this, ControlActivity.class));
+            return true;
+        } else if (id == R.id.action_server) {
+            if (ServerService.isRunning()) {
+                stopService(new Intent(this, ServerService.class));
+                Toast.makeText(this, "音频服务器已停止", Toast.LENGTH_SHORT).show();
+            } else {
+                String last = Settings.getInstance(this).getString("server_track_uri", "");
+                if (!last.isEmpty()) {
+                    new androidx.appcompat.app.AlertDialog.Builder(this)
+                            .setTitle("音频服务器")
+                            .setItems(new CharSequence[]{"播放上次曲目", "选择其他音频文件"},
+                                    (d, w) -> {
+                                        if (w == 0)
+                                            startServerService(Uri.parse(last));
+                                        else
+                                            openTrackLauncher.launch(new String[]{"audio/*"});
+                                    })
+                            .show();
+                } else {
+                    openTrackLauncher.launch(new String[]{"audio/*"});
+                }
+            }
             return true;
         } else if (id == R.id.action_about) {
             Intent intent = new Intent(this, AboutActivity.class);

@@ -105,10 +105,15 @@ public class ControlActivity extends AppCompatActivity {
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         String saved = sp.getString(KEY_HOST, "");
         if (saved.isEmpty()) {
-            // 与主界面 Settings 的 host 共享：snapnode 控制台端口固定 1780
-            String snapHost = Settings.getInstance(this).getHost();
-            if (snapHost != null && !snapHost.trim().isEmpty())
-                saved = snapHost.trim() + ":1780";
+            if (ServerService.isRunning()) {
+                // 本机就是服务器：直接连自己
+                saved = "127.0.0.1:1780";
+            } else {
+                // 与主界面 Settings 的 host 共享：snapnode 控制台端口固定 1780
+                String snapHost = Settings.getInstance(this).getHost();
+                if (snapHost != null && !snapHost.trim().isEmpty())
+                    saved = snapHost.trim() + ":1780";
+            }
         }
         etHost.setText(saved);
         applyHost(saved, false);

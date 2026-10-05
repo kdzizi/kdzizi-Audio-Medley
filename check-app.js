@@ -10,7 +10,10 @@ walk(SRC + '/res', p => {
   const dir = parts[0], name = parts[1];
   const t = fs.readFileSync(p, 'utf8');
   for (const m of t.matchAll(/android:id="@\+id\/([\w.]+)"/g)) ids.add(m[1]);
-  if (dir === 'values') for (const m of t.matchAll(/<string name="([\w.]+)"/g)) strings.add(m[1]);
+  if (dir === 'values') {
+    for (const m of t.matchAll(/<string name="([\w.]+)"/g)) strings.add(m[1]);
+    for (const m of t.matchAll(/<item\s+name="([\w.]+)"\s+type="id"\s*\/?>/g)) ids.add(m[1]);
+  }
   if (dir === 'layout') layouts.add(name.replace(/\.xml$/, ''));
   if (dir === 'menu') menus.add(name.replace(/\.xml$/, ''));
 });
