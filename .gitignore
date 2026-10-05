@@ -25,6 +25,16 @@ stats*.txt
 ffmpeg/
 snapclient/
 
+# 安卓工程构建产物（Studio 打开会生成 .idea/local.properties/build/.cxx）
+snapdroid-app/.gradle/
+snapdroid-app/.idea/
+snapdroid-app/build/
+snapdroid-app/local.properties
+snapdroid-app/*.iml
+snapdroid-app/Snapcast/build/
+snapdroid-app/Snapcast/.cxx/
+snapdroid-app/Snapcast/.externalNativeBuild/
+
 # 截图与临时产物（snapdroid-app 内的 png 图标要进库）
 *.png
 !snapdroid-app/**/*.png
