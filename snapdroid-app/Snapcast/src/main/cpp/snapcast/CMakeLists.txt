@@ -166,7 +166,7 @@ endif(${BIGENDIAN})
 
 # Check dependencies
 
-if(NOT WIN32) # no PkgConfig on Windows...
+if(NOT WIN32 AND NOT ANDROID) # no PkgConfig on Windows / not needed for Android (prefab deps)
   find_package(PkgConfig REQUIRED)
 endif()
 
