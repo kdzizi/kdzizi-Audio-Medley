@@ -291,7 +291,9 @@ const stream = net.createServer(sock => {
   });
   sock.on('error', () => {});
   sock.on('close', () => {
+    const wasReady = info.ready;
     clients.delete(sock);
+    if (wasReady) bump();
     console.log(`[-] client #${info.id} ${info.addr} 断开 (剩余 ${clients.size} 台)`);
   });
 });
@@ -310,7 +312,7 @@ function handle(sock, info, msg) {
     info.name = h.HostName || h.ClientName || '?';
     info.proto = h.SnapStreamProtocolVersion || 1;
     console.log(`    hello from #${info.id}: ${info.name} v${info.version} ${info.os} proto=${info.proto}`);
-    info.ready = true; // 握手后才算在线设备（局域网扫描的探测连接不会污染列表）
+    if (!info.ready) { info.ready = true; bump(); } // 握手后才算在线设备（扫描探针不在此列）
     // 关键：ServerSettings 的 refersTo 必须 = Hello 请求的 id，客户端按此匹配请求（2s 超时）
     sendSettings(sock, info, id);
     broadcast(CODEC_HEADER_MSG(), sock);
@@ -365,12 +367,64 @@ const control = net.createServer(sock => {
   sock.on('error', () => {});
 });
 
-stream.listen(PORT, '0.0.0.0', () => {
-  console.log(`[stream] listening 0.0.0.0:${PORT}`);
-  startUs = nowUs() + 300000; // 给客户端一点缓冲余量
-  tick();
+// stream/control 可以停了再起（退位→接管之间要能来回切）
+let ticking = false;
+function startStream() {
+  if (!control.listening) {
+    control.listen(CONTROL_PORT, '0.0.0.0', () => console.log(`[control] listening 0.0.0.0:${CONTROL_PORT}`));
+  }
+  if (stream.listening) return;
+  stream.listen(PORT, '0.0.0.0', () => {
+    console.log(`[stream] listening 0.0.0.0:${PORT}`);
+    startUs = nowUs() + 300000; // 给客户端一点缓冲余量
+    if (!ticking) { ticking = true; tick(); }
+  });
+}
+function stopStream() {
+  try { if (stream.listening) stream.close(() => console.log('[stream] 已停止发流（退位）')); } catch (e) {}
+  try { if (control.listening) control.close(); } catch (e) {}
+}
+
+/** 退位：断开自己所有客户端（它们会自动发现并连到新服务端），控制台转为代理 */
+function resignTo(target) {
+  upstream = target;
+  for (const [sock] of clients) { try { sock.destroy(); } catch (e) {} }
+  clients.clear();
+  stopStream();
+  console.log(`[role ] 已退位，音频源 = ${target}；本机 1780 控制台转为代理`);
+  bump();
+}
+
+/** 启动时先看看局域网里是不是已经有服务端了 —— 有就不抢，直接当遥控器（自动退让） */
+function probeExisting() {
+  return new Promise(resolve => {
+    const base = LOCAL_IP.split('.').slice(0, 3).join('.') + '.';
+    const me = LOCAL_IP;
+    let pending = 254, found = null, timer = null;
+    const finish = () => { if (timer) return; timer = setTimeout(() => resolve(found), 0); };
+    if (!process.env.SNAPNODE_NO_FOLLOW) {
+      for (let i = 1; i <= 254; i++) {
+        const ip = base + i;
+        if (ip === me) { if (--pending === 0) finish(); continue; }
+        const s = net.connect(PORT, ip);
+        s.setTimeout(400);
+        s.on('connect', () => { if (!found) found = ip; s.destroy(); });
+        s.on('error', () => s.destroy());
+        s.on('timeout', () => s.destroy());
+        s.on('close', () => { if (--pending === 0) finish(); });
+      }
+    } else finish();
+  });
+}
+
+probeExisting().then(found => {
+  if (found) {
+    upstream = `${found}:${HTTP_PORT}`;
+    console.log(`[role ] 局域网已有服务端 ${found}:${PORT}，本机自动退让（只当中控，:1780 代理到它）`);
+  } else {
+    startStream();
+  }
 });
-control.listen(CONTROL_PORT, '0.0.0.0', () => console.log(`[control] listening 0.0.0.0:${CONTROL_PORT}`));
 
 // 每 10 秒打印一次状态
 setInterval(() => {
@@ -380,8 +434,58 @@ setInterval(() => {
 }, 10000).unref?.();
 
 // ---------- HTTP 控制端（1780）：任意设备的浏览器都能当遥控器 ----------
-const HTTP_PORT = 1780;
+const HTTP_PORT = parseInt(process.env.SNAPNODE_HTTP_PORT || '1780', 10);
 const state = { paused: false };
+
+// ---------- 服务端角色：同一局域网只能有一个「源」 ----------
+// upstream 非空 = 本进程已退位，1780 控制台变成新服务端的透明代理（两边 API 同构）
+const HOSTNAME = os.hostname();
+let upstream = null;          // 'ip:port'，指向当前真正放音频流的那台
+let rev = 0;                  // 状态版本号，用于多端同步
+const sseClients = new Set(); // SSE 订阅者
+
+function statusObj() {
+  return {
+    server: {
+      host: LOCAL_IP, port: PORT, httpPort: HTTP_PORT, name: HOSTNAME,
+      source: path.basename(WAV),
+      role: upstream ? 'follower' : 'server',
+      upstream: upstream || null,
+    },
+    media: mediaInfo(),
+    eq: { ...DSP.eq },
+    clients: clientList(),
+  };
+}
+
+/** 状态变了就推给所有订阅端（SSE），多中控靠它保持一致 */
+function bump() {
+  rev++;
+  const payload = JSON.stringify({ ...statusObj(), rev });
+  for (const res of sseClients) {
+    try { res.write(`data: ${payload}\n\n`); } catch (e) { sseClients.delete(res); }
+  }
+}
+
+/** 退位后把控制请求原样转给上游（SSE 也能流式转发，因为只是管道） */
+function proxyApi(req, res, url) {
+  const u = new URL(`http://${upstream}${url.pathname}${url.search}`);
+  const p = http.request({
+    hostname: u.hostname, port: u.port || 80, path: u.pathname + u.search,
+    method: req.method, headers: { ...req.headers, host: u.host },
+  }, pr => {
+    res.writeHead(pr.statusCode || 502, {
+      'Content-Type': pr.headers['content-type'] || 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    });
+    pr.pipe(res);
+  });
+  p.on('error', e => {
+    try { res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' }); } catch (x) {}
+    res.end(JSON.stringify({ error: 'upstream unreachable: ' + e.message, upstream }));
+  });
+  req.pipe(p);
+}
 
 function clientList() {
   // ready=false 的是"只连了 TCP 还没握手"的连接（如局域网扫描的探测），不计入在线设备
@@ -406,13 +510,67 @@ const httpSrv = http.createServer((req, res) => {  const url = new URL(req.url, 
     try { return send(200, fs.readFileSync(path.join(__dirname, 'control.html')), 'text/html'); }
     catch (e) { return send(404, 'control.html not found'); }
   }
-  if (url.pathname === '/api/status') {
+  // 已退位时，控制类请求透明转给真正放流的那台（两边 API 同构）
+  const LOCAL_ONLY = new Set(['/api/handover', '/api/resume', '/api/follow', '/api/events', '/api/who']);
+  if (upstream && url.pathname.startsWith('/api/') && !LOCAL_ONLY.has(url.pathname))
+    return proxyApi(req, res, url);
+
+  // 本机角色（退位后中控靠它显示「当前服务端是谁」）
+  if (url.pathname === '/api/who') {
     return send(200, JSON.stringify({
-      server: { host: LOCAL_IP, port: PORT, source: path.basename(WAV) },
-      media: mediaInfo(),
-      eq: { ...DSP.eq },
-      clients: clientList(),
+      name: HOSTNAME, host: LOCAL_IP, port: PORT, httpPort: HTTP_PORT,
+      role: upstream ? 'follower' : 'server', upstream, rev,
     }));
+  }
+
+  // 状态推送（多端中控同步用）：状态一变就推一帧，订阅端不用靠轮询猜
+  if (url.pathname === '/api/events') {
+    if (upstream) return proxyApi(req, res, url);   // 退位后订阅上游
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*',
+    });
+    res.write(': ok\n\n');
+    try { res.write(`data: ${JSON.stringify({ ...statusObj(), rev })}\n\n`); } catch (e) {}
+    sseClients.add(res);
+    const hb = setInterval(() => { try { res.write(': ping\n\n'); } catch (e) {} }, 15000);
+    req.on('close', () => { clearInterval(hb); sseClients.delete(res); });
+    return;
+  }
+
+  // 接管：新服务端（手机 / 另一台 PC）来调这个接口，拿走曲目与进度，旧的随即退位
+  if (url.pathname === '/api/handover') {
+    const to = url.searchParams.get('to');
+    const httpPort = parseInt(url.searchParams.get('http') || String(HTTP_PORT), 10);
+    if (!to) return send(400, JSON.stringify({ error: 'missing ?to=<ip>' }));
+    send(200, JSON.stringify({
+      ok: true, handover: { to, httpPort },
+      media: mediaInfo(),               // 新服务端照它设曲目 + seek 到同一位置
+      clients: clientList().length,
+    }));
+    setImmediate(() => resignTo(`${to}:${httpPort}`));   // 先应答，再断流
+    return;
+  }
+
+  // 收回播放权：本机重新成为服务端
+  if (url.pathname === '/api/resume') {
+    upstream = null;
+    startStream();
+    bump();
+    return send(200, JSON.stringify({ ok: true, role: 'server' }));
+  }
+
+  // 手动跟随某台服务端（不接管，只把本机中控指向它）
+  if (url.pathname === '/api/follow') {
+    const to = url.searchParams.get('to');
+    const httpPort = parseInt(url.searchParams.get('http') || String(HTTP_PORT), 10);
+    if (!to) return send(400, JSON.stringify({ error: 'missing ?to=<ip>' }));
+    resignTo(`${to}:${httpPort}`);
+    return send(200, JSON.stringify({ ok: true, upstream }));
+  }
+
+  if (url.pathname === '/api/status') {
+    return send(200, JSON.stringify({ ...statusObj(), rev }));
   }
   // 快进/快退：/api/seek?sec=10 或 sec=-15，直接移动 PCM 读取位置
   if (url.pathname === '/api/seek') {
@@ -420,6 +578,7 @@ const httpSrv = http.createServer((req, res) => {  const url = new URL(req.url, 
     let off = readOff + Math.round(sec * BYTES_PER_MS * 1000);
     off = ((off % pcm.length) + pcm.length) % pcm.length;
     readOff = off;
+    bump();
     return send(200, JSON.stringify({ ok: true, media: mediaInfo() }));
   }
   // /api/vol?id=1&v=70   省略 id = 全局
@@ -428,6 +587,7 @@ const httpSrv = http.createServer((req, res) => {  const url = new URL(req.url, 
     const id = url.searchParams.get('id');
     if (id) { const t = findById(id); if (t) { t.c.volume = v; sendSettings(t.sock, t.c); } }
     else for (const [sock, c] of clients) { c.volume = v; sendSettings(sock, c); }
+    bump();
     return send(200, JSON.stringify({ ok: true, clients: clientList() }));
   }
   if (url.pathname === '/api/mute') {
@@ -436,6 +596,7 @@ const httpSrv = http.createServer((req, res) => {  const url = new URL(req.url, 
     const apply = (sock, c) => { c.muted = m === null ? !c.muted : (m === '1' || m === 'true'); sendSettings(sock, c); };
     if (id) { const t = findById(id); if (t) apply(t.sock, t.c); }
     else for (const [sock, c] of clients) apply(sock, c);
+    bump();
     return send(200, JSON.stringify({ ok: true, clients: clientList() }));
   }
   // 人为延迟（对照实验）：给某台设备的播放时间戳加偏移，让它比别人晚发声
@@ -444,6 +605,7 @@ const httpSrv = http.createServer((req, res) => {  const url = new URL(req.url, 
     const ms = Math.max(-200, Math.min(500, parseInt(url.searchParams.get('ms') ?? '0', 10) || 0));
     const t = findById(id);
     if (t) t.c.offsetMs = ms;
+    bump();
     return send(200, JSON.stringify({ ok: !!t, clients: clientList() }));
   }
   // EQ：/api/eq?preset=bass 或 ?low=6&mid=2&high=4（dB，-12..12）
@@ -456,6 +618,7 @@ const httpSrv = http.createServer((req, res) => {  const url = new URL(req.url, 
       if (!isNaN(v)) DSP.eq[k] = Math.max(-12, Math.min(12, v));
     }
     rebuildEQ();
+    bump();
     return send(200, JSON.stringify({ ok: true, eq: DSP.eq }));
   }
   // 每设备频段角色：full / low(低音炮) / high(卫星箱)
@@ -463,6 +626,7 @@ const httpSrv = http.createServer((req, res) => {  const url = new URL(req.url, 
     const t = findById(url.searchParams.get('id'));
     const band = url.searchParams.get('band');
     if (t && ['full', 'low', 'high'].includes(band)) { t.c.band = band; t.c.bandF = null; }
+    bump();
     return send(200, JSON.stringify({ ok: !!t, clients: clientList() }));
   }
   // 新设备接入：直接下载安卓客户端 APK
@@ -475,6 +639,7 @@ const httpSrv = http.createServer((req, res) => {  const url = new URL(req.url, 
   }
   if (url.pathname === '/api/pause') {
     state.paused = url.searchParams.get('p') === '1';
+    bump();
     return send(200, JSON.stringify({ ok: true, paused: state.paused }));
   }
   send(404, JSON.stringify({ error: 'not found' }));

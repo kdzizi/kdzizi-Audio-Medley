@@ -43,6 +43,7 @@
 <div class="top">
   <h1>Snapcast 控制台</h1>
   <span class="sub" id="srv">连接中…</span>
+  <button id="takeback" style="display:none;font-size:12px;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer" onclick="takeBack()">收回播放权</button>
 </div>
 
 <div class="card" style="background:var(--acc2);border-color:#c9daf7">
@@ -107,10 +108,31 @@ let pos = { sec: 0, dur: 1, dragging: false, paused: false };
 
 async function api(u){ const r = await fetch(u); return r.json(); }
 
+// 本机角色：是自己在放流，还是已经把播放权交给了别人（此时本页是代理）
+async function refreshRole(){
+  try {
+    const w = await api('/api/who');
+    const mine = w.role === 'server';
+    $('#srv').textContent = mine
+      ? `${w.host} · 本机放流`
+      : `${w.upstream} · 播放权已交出（本页为代理）`;
+    $('#takeback').style.display = mine ? 'none' : '';
+  } catch(e){ $('#srv').textContent = '服务端未响应'; }
+}
+async function takeBack(){
+  await api('/api/resume');
+  $('#takeback').style.display = 'none';
+  setTimeout(render, 500);
+}
+
 async function render(){
   let s;
   try { s = await api('/api/status'); } catch(e){ $('#srv').textContent = '服务端未响应'; return; }
-  $('#srv').textContent = s.server.host;
+  await renderData(s);
+}
+
+async function renderData(s){
+  await refreshRole();
   $('#iphint').textContent = s.server.host;
 
   const eq = s.eq;
@@ -181,7 +203,13 @@ $('#gzero').onclick = async () => {
   render();
 };
 
-render(); setInterval(render, 2000);
+// 多端同步：服务端一有变化就推一帧，别的遥控器（APK 中控等）动过这里立刻跟着变；
+// SSE 断掉时靠轮询兜底
+try {
+  const es = new EventSource('/api/events');
+  es.onmessage = ev => { try { renderData(JSON.parse(ev.data)); } catch(e){} };
+} catch(e){}
+render(); setInterval(render, 5000);
 </script>
 </body>
 </html>
